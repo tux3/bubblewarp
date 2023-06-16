@@ -1,0 +1,16 @@
+[package]
+name = "bubblewarp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.4", features = ["macros", "rt-multi-thread"] }
+anyhow = "1.0.43"
+tracing = "0.1.26"
+tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
+clap = { version = "4.3.0", features = ["cargo", "derive"] }
+nix = "0.26.2"
+directories = "5.0.1"
+strum = "0.24"
+strum_macros = "0.24"
+procfs = "0.15.1"
