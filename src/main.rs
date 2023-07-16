@@ -5,6 +5,7 @@ use crate::up::up;
 mod down;
 use crate::down::down;
 mod namespace;
+mod net;
 
 use anyhow::{bail, Result};
 use clap::Parser;

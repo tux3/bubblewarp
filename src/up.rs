@@ -1,5 +1,6 @@
 use crate::namespace;
-use crate::namespace::{mount_point, run_inside_namespace, Status};
+use crate::namespace::{mount_point, run_inside_namespace, Status, Type};
+use crate::net::{setup_external_networking, setup_private_networking};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::Write;
@@ -107,7 +108,6 @@ pub fn create_namespaces(base_dir: &Path) -> Result<()> {
     debug!("Calling unshare to create persistent namespaces");
     let output = Command::new("unshare")
         .arg("--fork")
-        .arg("--mount-proc")
         .arg("-r")
         .arg("--map-users=0,0,1200")
         .arg("--map-groups=0,0,1200")
@@ -137,20 +137,26 @@ pub fn create_etc_overlay_inside(base_dir: &Path) -> Result<()> {
     let upper = overlay_dir.join("upper");
     let work = overlay_dir.join("work");
 
+    let mount_out = run_inside_namespace(base_dir, Type::Mount, &Command::new("mount"))?;
+    if String::from_utf8_lossy(&mount_out.stdout).contains("overlay on /etc type overlay") {
+        debug!("/etc overlay appears already mounted, not mounting it again");
+        return Ok(());
+    }
+
     std::fs::create_dir_all(&extra_lower)?;
     std::fs::create_dir_all(&upper)?;
     std::fs::create_dir_all(&work)?;
 
     let resolv_path = extra_lower.join("resolv.conf");
-    let mut f = File::create(resolv_path)?;
-    f.write_all(
-        b"# This is a hardcoded overlay of resolv.conf in the WARP container
+    let resolv_file_data = b"# This is a hardcoded overlay of resolv.conf in the WARP container
 nameserver 127.0.2.2
 nameserver 127.0.2.3
 nameserver fd01:db8:1111::2
 nameserver fd01:db8:1111::3
-",
-    )?;
+";
+
+    let mut f = File::create(resolv_path)?;
+    f.write_all(resolv_file_data)?;
     drop(f);
 
     debug!("Mount read-only /etc overlay inside namespace");
@@ -164,44 +170,4 @@ nameserver fd01:db8:1111::3
     run_inside_namespace(base_dir, namespace::Type::Mount, &cmd)?;
 
     Ok(())
-}
-
-pub fn setup_private_networking(base_dir: &Path) -> Result<()> {
-    if nix::ifaddrs::getifaddrs()?.any(|dev| dev.interface_name == "veth-warp") {
-        debug!("veth-warp iface seems to already exist, not re-creating it");
-        return Ok(());
-    }
-
-    debug!("Setting up veth pair for private networking");
-    let net_ns = mount_point(base_dir, namespace::Type::Net);
-    Command::new("ip")
-        .args(["link", "add", "veth-warp", "type", "veth"])
-        .args(["peer", "name", "veth-warp-ns"])
-        .args(["netns", net_ns.to_string_lossy().as_ref()])
-        .status()?
-        .exit_ok()?;
-    Command::new("ip")
-        .args(["addr", "add", "10.200.0.1/24", "dev", "veth-warp"])
-        .status()?
-        .exit_ok()?;
-    Command::new("ip")
-        .args(["link", "set", "veth-warp", "up"])
-        .status()?
-        .exit_ok()?;
-
-    run_inside_namespace(
-        base_dir,
-        namespace::Type::Net,
-        Command::new("ip").args(["addr", "add", "10.200.0.2/24", "dev", "veth-warp-ns"]),
-    )?;
-    run_inside_namespace(
-        base_dir,
-        namespace::Type::Net,
-        Command::new("ip").args(["link", "set", "veth-warp-ns", "up"]),
-    )?;
-    Ok(())
-}
-
-pub fn setup_external_networking(base_dir: &Path) -> Result<()> {
-    todo!()
 }

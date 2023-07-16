@@ -1,25 +1,52 @@
-use crate::namespace;
-use crate::namespace::{is_mounted, run_inside_namespace, Type};
+use crate::namespace::{self, is_mounted, run_inside_namespace, Type};
+use crate::net::default_route_iface_name;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use strum::IntoEnumIterator;
 
 pub fn down() -> Result<()> {
     let base_dir = namespace::base_dir()?;
 
+    // TODO:
+    //  - If the namespaces exist, kill any processes running inside any of the namespaces!
+
     if is_mounted(&base_dir, Type::Mount)? {
         clean_mount_namespace(&base_dir)?;
     }
-
+    if is_mounted(&base_dir, Type::Net)? {
+        cleanup_external_networking()?;
+    }
     cleanup_private_networking(&base_dir)?;
 
-    // TODO:
-    //  - Cleanup external networking (eth/wifi)
-    //  - If the namespaces exist, kill any processes running inside any of the namespaces!
     unmount_namespaces(&base_dir)?;
     let _ = nix::mount::umount(&base_dir);
-    unimplemented!()
+    Ok(())
+}
+
+fn cleanup_external_networking() -> Result<()> {
+    let iface_name = default_route_iface_name()?;
+    delete_iptables_rule(&format!(
+        "POSTROUTING -t nat -s 10.200.0.0/24 -o {iface_name} -j MASQUERADE"
+    ));
+    delete_iptables_rule(&format!("FORWARD -i {iface_name} -o veth-warp -j ACCEPT"));
+    delete_iptables_rule(&format!("FORWARD -o {iface_name} -i veth-warp -j ACCEPT"));
+    Ok(())
+}
+
+fn delete_iptables_rule(rule: &str) {
+    let rule_words: Vec<&str> = rule.split(' ').collect();
+    loop {
+        let status = Command::new("/usr/sbin/iptables")
+            .arg("-D")
+            .args(&rule_words)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        if !status.success() {
+            break;
+        }
+    }
 }
 
 fn cleanup_private_networking(base_dir: &Path) -> Result<()> {
@@ -54,7 +81,7 @@ fn clean_mount_namespace(base_dir: &Path) -> Result<()> {
 }
 
 pub fn unmount_namespaces(base_dir: &Path) -> Result<()> {
-    for ns_type in namespace::Type::iter() {
+    for ns_type in Type::iter() {
         if is_mounted(base_dir, ns_type)? {
             unmount_one_namespace(base_dir, ns_type)?;
         }
@@ -62,7 +89,7 @@ pub fn unmount_namespaces(base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn unmount_one_namespace(base_dir: &Path, ns_type: namespace::Type) -> Result<()> {
+pub fn unmount_one_namespace(base_dir: &Path, ns_type: Type) -> Result<()> {
     let ns_mount_point = namespace::mount_point(base_dir, ns_type);
     nix::mount::umount(&ns_mount_point).context("Unmounting persistent namespace")?;
     Ok(())
