@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount as EnumCountMacro, EnumIter};
 use tracing::trace;
@@ -11,6 +12,18 @@ pub enum Type {
     Pid,
     Mount,
     Net,
+}
+
+impl ToString for Type {
+    fn to_string(&self) -> String {
+        match self {
+            Type::User => "user",
+            Type::Pid => "pid",
+            Type::Mount => "mount",
+            Type::Net => "net",
+        }
+        .to_owned()
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -87,4 +100,31 @@ pub fn mount_point(base_dir: &Path, ns_type: Type) -> PathBuf {
         Type::Net => path.push("net"),
     };
     path
+}
+
+pub fn run_inside_namespace(base_dir: &Path, ns_type: Type, cmd: &Command) -> Result<Output> {
+    let mut ns_cmd = Command::new("nsenter");
+    ns_cmd.arg(format!(
+        "--{}={}",
+        ns_type.to_string(),
+        mount_point(base_dir, ns_type).to_string_lossy()
+    ));
+
+    ns_cmd.arg(cmd.get_program());
+    ns_cmd.args(cmd.get_args());
+    if let Some(cwd) = cmd.get_current_dir() {
+        ns_cmd.current_dir(cwd);
+    }
+
+    let out = ns_cmd.output()?;
+    if !out.status.success() {
+        bail!(
+            "Failed to run command {} inside namespaces, returned {}\nstdout: {}\nstderr: {}",
+            cmd.get_program().to_string_lossy(),
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        )
+    }
+    Ok(out)
 }

@@ -1,7 +1,10 @@
 use crate::namespace;
-use crate::namespace::Status;
+use crate::namespace::{mount_point, run_inside_namespace, Status};
 use anyhow::{bail, Context, Result};
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 use strum::IntoEnumIterator;
 use tracing::{debug, info, trace, warn};
 
@@ -22,12 +25,8 @@ pub fn up() -> Result<()> {
         Status::Ready => {
             info!("Namespaces already mounted")
         }
-        Status::Partial(mounted_set) => {
-            warn!("Namespaces partially mounted, cleaning up and re-creating the namespaces");
-            todo!(
-                "call all the down functions _EXCEPT_ destroying the private self bind mount here"
-            );
-            create_namespaces(&base_dir)?;
+        Status::Partial(_mounted_set) => {
+            bail!("Namespaces partially mounted! Try calling the down command again");
         }
         Status::None => {
             create_namespaces(&base_dir)?;
@@ -35,6 +34,8 @@ pub fn up() -> Result<()> {
     }
 
     create_etc_overlay_inside(&base_dir)?;
+    setup_private_networking(&base_dir)?;
+    setup_external_networking(&base_dir)?;
     Ok(())
 }
 
@@ -93,16 +94,13 @@ pub fn private_self_bind_mount_base_dir(base_dir: &Path) -> Result<()> {
 }
 
 pub fn create_namespaces(base_dir: &Path) -> Result<()> {
-    use namespace::mount_point;
     use namespace::Type::*;
-    use std::process::Command;
 
     debug!("Creating mount points for persistent namespaces");
     for ns_type in namespace::Type::iter() {
         let ns_mount_point = mount_point(base_dir, ns_type);
         if !ns_mount_point.exists() {
-            std::fs::File::create(ns_mount_point)
-                .context("Creating persistent namespace mount point")?;
+            File::create(ns_mount_point).context("Creating persistent namespace mount point")?;
         }
     }
 
@@ -134,5 +132,76 @@ pub fn create_namespaces(base_dir: &Path) -> Result<()> {
 }
 
 pub fn create_etc_overlay_inside(base_dir: &Path) -> Result<()> {
-    todo!("Enter and create overlay /etc rw mount inside the namespace")
+    let overlay_dir = base_dir.join("etc_overlay");
+    let extra_lower = overlay_dir.join("extra_lower");
+    let upper = overlay_dir.join("upper");
+    let work = overlay_dir.join("work");
+
+    std::fs::create_dir_all(&extra_lower)?;
+    std::fs::create_dir_all(&upper)?;
+    std::fs::create_dir_all(&work)?;
+
+    let resolv_path = extra_lower.join("resolv.conf");
+    let mut f = File::create(resolv_path)?;
+    f.write_all(
+        b"# This is a hardcoded overlay of resolv.conf in the WARP container
+nameserver 127.0.2.2
+nameserver 127.0.2.3
+nameserver fd01:db8:1111::2
+nameserver fd01:db8:1111::3
+",
+    )?;
+    drop(f);
+
+    debug!("Mount read-only /etc overlay inside namespace");
+    let opt_lower = format!("lowerdir={}:/etc", extra_lower.to_string_lossy());
+    let opt_upper = format!("upperdir={}", upper.to_string_lossy());
+    let opt_work = format!("workdir={}", work.to_string_lossy());
+    let mut cmd = Command::new("mount");
+    cmd.args(["-t", "overlay", "overlay"])
+        .arg(format!("-o{opt_lower},{opt_upper},{opt_work}"))
+        .arg("/etc");
+    run_inside_namespace(base_dir, namespace::Type::Mount, &cmd)?;
+
+    Ok(())
+}
+
+pub fn setup_private_networking(base_dir: &Path) -> Result<()> {
+    if nix::ifaddrs::getifaddrs()?.any(|dev| dev.interface_name == "veth-warp") {
+        debug!("veth-warp iface seems to already exist, not re-creating it");
+        return Ok(());
+    }
+
+    debug!("Setting up veth pair for private networking");
+    let net_ns = mount_point(base_dir, namespace::Type::Net);
+    Command::new("ip")
+        .args(["link", "add", "veth-warp", "type", "veth"])
+        .args(["peer", "name", "veth-warp-ns"])
+        .args(["netns", net_ns.to_string_lossy().as_ref()])
+        .status()?
+        .exit_ok()?;
+    Command::new("ip")
+        .args(["addr", "add", "10.200.0.1/24", "dev", "veth-warp"])
+        .status()?
+        .exit_ok()?;
+    Command::new("ip")
+        .args(["link", "set", "veth-warp", "up"])
+        .status()?
+        .exit_ok()?;
+
+    run_inside_namespace(
+        base_dir,
+        namespace::Type::Net,
+        Command::new("ip").args(["addr", "add", "10.200.0.2/24", "dev", "veth-warp-ns"]),
+    )?;
+    run_inside_namespace(
+        base_dir,
+        namespace::Type::Net,
+        Command::new("ip").args(["link", "set", "veth-warp-ns", "up"]),
+    )?;
+    Ok(())
+}
+
+pub fn setup_external_networking(base_dir: &Path) -> Result<()> {
+    todo!()
 }
