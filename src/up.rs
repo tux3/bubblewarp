@@ -1,5 +1,7 @@
 use crate::namespace;
-use crate::namespace::{mount_point, run_inside_namespace, Status, Type};
+use crate::namespace::{
+    mount_point, run_inside_namespace, spawn_inside_all_namespaces, Status, Type,
+};
 use crate::net::{setup_external_networking, setup_private_networking};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
@@ -37,6 +39,10 @@ pub fn up() -> Result<()> {
     create_etc_overlay_inside(&base_dir)?;
     setup_private_networking(&base_dir)?;
     setup_external_networking(&base_dir)?;
+    spawn_warp(&base_dir)?;
+
+    // TODO: Setup HTTP proxy inside the namespace to route traffic through WARP
+
     Ok(())
 }
 
@@ -169,5 +175,22 @@ nameserver fd01:db8:1111::3
         .arg("/etc");
     run_inside_namespace(base_dir, namespace::Type::Mount, &cmd)?;
 
+    Ok(())
+}
+
+pub fn spawn_warp(base_dir: &Path) -> Result<()> {
+    for proc in procfs::process::all_processes()? {
+        let Ok(proc) = proc else { continue };
+        let Ok(cmdline) = proc.cmdline() else {
+            continue;
+        };
+        if cmdline.is_empty() || !cmdline[0].ends_with("warp-svc") {
+            continue;
+        }
+        warn!("There appears to already be a warp-svc process running, not starting another")
+    }
+
+    debug!("Spawning warp-svc process inside container");
+    spawn_inside_all_namespaces(base_dir, &Command::new("warp-svc"))?;
     Ok(())
 }

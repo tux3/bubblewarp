@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount as EnumCountMacro, EnumIter};
 use tracing::trace;
@@ -102,6 +103,14 @@ pub fn mount_point(base_dir: &Path, ns_type: Type) -> PathBuf {
     path
 }
 
+fn wrap_cmd(wrapper: &mut Command, cmd: &Command) {
+    wrapper.arg(cmd.get_program());
+    wrapper.args(cmd.get_args());
+    if let Some(cwd) = cmd.get_current_dir() {
+        wrapper.current_dir(cwd);
+    }
+}
+
 pub fn run_inside_namespace(base_dir: &Path, ns_type: Type, cmd: &Command) -> Result<Output> {
     let mut ns_cmd = Command::new("nsenter");
     ns_cmd.arg(format!(
@@ -109,12 +118,7 @@ pub fn run_inside_namespace(base_dir: &Path, ns_type: Type, cmd: &Command) -> Re
         ns_type.to_string(),
         mount_point(base_dir, ns_type).to_string_lossy()
     ));
-
-    ns_cmd.arg(cmd.get_program());
-    ns_cmd.args(cmd.get_args());
-    if let Some(cwd) = cmd.get_current_dir() {
-        ns_cmd.current_dir(cwd);
-    }
+    wrap_cmd(&mut ns_cmd, cmd);
 
     let out = ns_cmd.output()?;
     if !out.status.success() {
@@ -127,4 +131,34 @@ pub fn run_inside_namespace(base_dir: &Path, ns_type: Type, cmd: &Command) -> Re
         )
     }
     Ok(out)
+}
+
+pub fn spawn_inside_all_namespaces(base_dir: &Path, cmd: &Command) -> Result<std::process::Child> {
+    // There is a weird dance we have to do, where nsenter will make fork failed if used directly
+    // But if we start a dummy cat process with nsenter, and then enter cat's namespaces, all good
+    let mut cat_cmd = Command::new("nsenter");
+    cat_cmd.arg("-F");
+    for ns_type in Type::iter() {
+        cat_cmd.arg(format!(
+            "--{}={}",
+            ns_type.to_string(),
+            mount_point(base_dir, ns_type).to_string_lossy()
+        ));
+    }
+    cat_cmd.arg("cat");
+    let mut cat_handle = cat_cmd.spawn()?;
+
+    let mut ns_cmd = Command::new("nsenter");
+    ns_cmd.args(["-a", "-t", &cat_handle.id().to_string()]);
+    ns_cmd.stdout(Stdio::null());
+    ns_cmd.stderr(Stdio::null());
+    wrap_cmd(&mut ns_cmd, cmd);
+    let child = ns_cmd.spawn()?;
+
+    // Disgusting hardcoded sleep. We just want to give nsenter time to finish joining...
+    // Ideally we should watch that the new process has entered all the namespaces.. but good enough!
+    std::thread::sleep(Duration::from_millis(250));
+    let _ = cat_handle.kill();
+
+    Ok(child)
 }
