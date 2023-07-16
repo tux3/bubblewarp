@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use nix::unistd;
 use nix::unistd::ROOT;
-use tracing::info;
+use tracing::debug;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -57,7 +57,7 @@ fn ensure_root() -> Result<()> {
         bail!("We are not running as root!")
     } else if !unistd::getuid().is_root() {
         // We are not root, but we're suid root. Elevate.
-        info!("Running as setuid root. Strange, but continuing happily.");
+        debug!("Running as setuid root. Continuing happily.");
         unistd::setuid(ROOT).expect("Failed to setuid(0), but we have euid 0!");
     }
     Ok(())

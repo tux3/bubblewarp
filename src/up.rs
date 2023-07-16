@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 use strum::IntoEnumIterator;
 use tracing::{debug, info, trace, warn};
 
@@ -39,9 +40,12 @@ pub fn up() -> Result<()> {
     create_etc_overlay_inside(&base_dir)?;
     setup_private_networking(&base_dir)?;
     setup_external_networking(&base_dir)?;
-    spawn_warp(&base_dir)?;
+    spawn_process_inside(&base_dir, "warp-svc")?;
 
-    // TODO: Setup HTTP proxy inside the namespace to route traffic through WARP
+    // TODO: Wait for warp interface to be up inside the container instead of a hard sleep..
+    std::thread::sleep(Duration::from_millis(1000));
+
+    spawn_process_inside(&base_dir, "/usr/sbin/danted")?;
 
     Ok(())
 }
@@ -153,17 +157,30 @@ pub fn create_etc_overlay_inside(base_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&upper)?;
     std::fs::create_dir_all(&work)?;
 
-    let resolv_path = extra_lower.join("resolv.conf");
-    let resolv_file_data = b"# This is a hardcoded overlay of resolv.conf in the WARP container
+    {
+        let resolv_path = extra_lower.join("resolv.conf");
+        let resolv_file_data = b"# This is a hardcoded overlay of resolv.conf in the WARP container
 nameserver 127.0.2.2
 nameserver 127.0.2.3
 nameserver fd01:db8:1111::2
 nameserver fd01:db8:1111::3
 ";
+        let mut f = File::create(resolv_path)?;
+        f.write_all(resolv_file_data)?;
+    }
 
-    let mut f = File::create(resolv_path)?;
-    f.write_all(resolv_file_data)?;
-    drop(f);
+    {
+        let danted_path = extra_lower.join("danted.conf");
+        let file_data = b"internal: 10.200.0.2 port = 8080
+external: CloudflareWARP
+socksmethod: none
+clientmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+";
+        let mut f = File::create(danted_path)?;
+        f.write_all(file_data)?;
+    }
 
     debug!("Mount read-only /etc overlay inside namespace");
     let opt_lower = format!("lowerdir={}:/etc", extra_lower.to_string_lossy());
@@ -178,19 +195,20 @@ nameserver fd01:db8:1111::3
     Ok(())
 }
 
-pub fn spawn_warp(base_dir: &Path) -> Result<()> {
+pub fn spawn_process_inside(base_dir: &Path, name: &str) -> Result<()> {
     for proc in procfs::process::all_processes()? {
         let Ok(proc) = proc else { continue };
         let Ok(cmdline) = proc.cmdline() else {
             continue;
         };
-        if cmdline.is_empty() || !cmdline[0].ends_with("warp-svc") {
+        if cmdline.is_empty() || !cmdline[0].ends_with(name) {
             continue;
         }
-        warn!("There appears to already be a warp-svc process running, not starting another")
+        warn!("There appears to already be a {name} process running, not starting another");
+        return Ok(());
     }
 
-    debug!("Spawning warp-svc process inside container");
-    spawn_inside_all_namespaces(base_dir, &Command::new("warp-svc"))?;
+    debug!("Spawning {name} process inside namespaces");
+    spawn_inside_all_namespaces(base_dir, &Command::new(name))?;
     Ok(())
 }

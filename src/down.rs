@@ -1,15 +1,19 @@
-use crate::namespace::{self, is_mounted, run_inside_namespace, Type};
+use crate::namespace::{self, find_process_in_namespace, is_mounted, run_inside_namespace, Type};
 use crate::net::default_route_iface_name;
 use anyhow::{bail, Context, Result};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use strum::IntoEnumIterator;
+use tracing::debug;
 
 pub fn down() -> Result<()> {
     let base_dir = namespace::base_dir()?;
 
-    // TODO:
-    //  - If the namespaces exist, kill any processes running inside any of the namespaces!
+    kill_process("warp-svc")?;
+    kill_process("danted")?;
+    kill_process("danted: io-chil")?;
 
     if is_mounted(&base_dir, Type::Mount)? {
         clean_mount_namespace(&base_dir)?;
@@ -21,6 +25,14 @@ pub fn down() -> Result<()> {
 
     unmount_namespaces(&base_dir)?;
     let _ = nix::mount::umount(&base_dir);
+    Ok(())
+}
+
+fn kill_process(name: &str) -> Result<()> {
+    if let Some(pid) = find_process_in_namespace(name)? {
+        debug!("Killing running {name} process");
+        kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
+    }
     Ok(())
 }
 
