@@ -1,7 +1,5 @@
 use crate::namespace;
-use crate::namespace::{
-    mount_point, run_inside_namespace, spawn_inside_all_namespaces, Status, Type,
-};
+use crate::namespace::{all_ns_processes, mount_point, spawn_inside_all_namespaces, Status, Type};
 use crate::net::{setup_external_networking, setup_private_networking};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
@@ -25,29 +23,47 @@ pub fn up() -> Result<()> {
         private_self_bind_mount_base_dir(&base_dir)?;
     }
 
-    match namespace::status(&base_dir)? {
+    let init_proc = match namespace::status(&base_dir)? {
         Status::Ready => {
-            info!("Namespaces already mounted")
+            if let Some(proc) = find_pid_ns_init_process(&base_dir)? {
+                info!("Namespaces already mounted, continuing");
+                proc
+            } else {
+                bail!(
+                    "Namespaces already mounted, but init process is dead. Try calling the down command first"
+                );
+            }
         }
         Status::Partial(_mounted_set) => {
-            bail!("Namespaces partially mounted! Try calling the down command again");
+            bail!("Namespaces partially mounted! Try calling the down command first");
         }
-        Status::None => {
-            create_namespaces(&base_dir)?;
-        }
-    }
+        Status::None => create_namespaces(&base_dir)?,
+    };
+    let ns_init_pid = init_proc.pid as u32;
 
-    create_etc_overlay_inside(&base_dir)?;
+    create_etc_overlay_inside(&base_dir, ns_init_pid)?;
     setup_private_networking(&base_dir)?;
     setup_external_networking(&base_dir)?;
-    spawn_process_inside(&base_dir, "warp-svc")?;
+    spawn_process_inside("warp-svc", ns_init_pid)?;
 
     // TODO: Wait for warp interface to be up inside the container instead of a hard sleep..
+    //       Also, try starting danted every 250ms for ~2s max and check that it's still running 250ms later
     std::thread::sleep(Duration::from_millis(1000));
 
-    spawn_process_inside(&base_dir, "/usr/sbin/danted")?;
+    spawn_process_inside("/usr/sbin/danted", ns_init_pid)?;
 
     Ok(())
+}
+
+fn find_pid_ns_init_process(base_dir: &Path) -> Result<Option<procfs::process::Process>> {
+    let ns_procs = all_ns_processes(base_dir)?;
+    for proc in ns_procs {
+        let cmdline = proc.cmdline()?;
+        if !cmdline.is_empty() && cmdline[0] == "tini" {
+            return Ok(Some(proc));
+        }
+    }
+    Ok(None)
 }
 
 pub fn base_dir_has_private_self_bind_mount(base_dir: &Path) -> Result<bool> {
@@ -104,11 +120,11 @@ pub fn private_self_bind_mount_base_dir(base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn create_namespaces(base_dir: &Path) -> Result<()> {
+pub fn create_namespaces(base_dir: &Path) -> Result<procfs::process::Process> {
     use namespace::Type::*;
 
     debug!("Creating mount points for persistent namespaces");
-    for ns_type in namespace::Type::iter() {
+    for ns_type in Type::iter() {
         let ns_mount_point = mount_point(base_dir, ns_type);
         if !ns_mount_point.exists() {
             File::create(ns_mount_point).context("Creating persistent namespace mount point")?;
@@ -116,9 +132,10 @@ pub fn create_namespaces(base_dir: &Path) -> Result<()> {
     }
 
     debug!("Calling unshare to create persistent namespaces");
-    let output = Command::new("unshare")
+    let unshare_handle = Command::new("unshare")
         .arg("--fork")
         .arg("-r")
+        .arg("--mount-proc")
         .arg("--map-users=0,0,1200")
         .arg("--map-groups=0,0,1200")
         .arg(format!("--pid={}", mount_point(base_dir, Pid).display()))
@@ -128,26 +145,71 @@ pub fn create_namespaces(base_dir: &Path) -> Result<()> {
             "--mount={}",
             mount_point(base_dir, Mount).display()
         ))
-        .args(["--", "echo", "ok"])
-        .output()?;
-    if !output.status.success() {
-        bail!(
-            "Failed to create namespaces, unshare returned {}\nstdout: {}\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        )
+        .args(["--", "tini", "--", "sleep", "infinity"])
+        .spawn()?;
+
+    std::thread::sleep(Duration::from_millis(25));
+    let unshare_proc = procfs::process::Process::new(unshare_handle.id() as i32)?;
+
+    let start_time = std::time::Instant::now();
+    let unshare_child_pid = loop {
+        if !unshare_proc.is_alive() {
+            let output = unshare_handle.wait_with_output()?;
+            bail!(
+                "Failed to create namespaces, unshare exited with {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        }
+
+        let mut unshare_tasks: Vec<_> = unshare_proc.tasks()?.collect();
+        if unshare_tasks.len() != 1 {
+            bail!(
+                "Unshare process has {} tasks, expected 1!",
+                unshare_tasks.len()
+            )
+        }
+        let unshare_task = unshare_tasks.remove(0)?;
+        let unshare_children = unshare_task.children()?;
+        if !unshare_children.is_empty() {
+            if unshare_children.len() != 1 {
+                for p in &unshare_children {
+                    warn!("{}", p);
+                }
+                bail!(
+                    "Unshare process has {} children, expected 1!",
+                    unshare_children.len()
+                )
+            }
+            break unshare_children[0];
+        }
+
+        if std::time::Instant::now().duration_since(start_time) > Duration::from_secs(1) {
+            bail!("Timed out waiting for namespace creation")
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let tini_proc = procfs::process::Process::new(unshare_child_pid as i32)?;
+    if !tini_proc.is_alive() {
+        bail!("namespace init process died!")
     }
-    Ok(())
+    trace!(
+        "tini proc running with namespaces {:?}",
+        tini_proc.namespaces()
+    );
+    Ok(tini_proc)
 }
 
-pub fn create_etc_overlay_inside(base_dir: &Path) -> Result<()> {
+pub fn create_etc_overlay_inside(base_dir: &Path, ns_init_pid: u32) -> Result<()> {
     let overlay_dir = base_dir.join("etc_overlay");
     let extra_lower = overlay_dir.join("extra_lower");
     let upper = overlay_dir.join("upper");
     let work = overlay_dir.join("work");
 
-    let mount_out = run_inside_namespace(base_dir, Type::Mount, &Command::new("mount"))?;
+    let mount_child = spawn_inside_all_namespaces(&Command::new("mount"), ns_init_pid)?;
+    let mount_out = mount_child.wait_with_output()?;
     if String::from_utf8_lossy(&mount_out.stdout).contains("overlay on /etc type overlay") {
         debug!("/etc overlay appears already mounted, not mounting it again");
         return Ok(());
@@ -190,12 +252,12 @@ socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
     cmd.args(["-t", "overlay", "overlay"])
         .arg(format!("-o{opt_lower},{opt_upper},{opt_work}"))
         .arg("/etc");
-    run_inside_namespace(base_dir, namespace::Type::Mount, &cmd)?;
+    spawn_inside_all_namespaces(&cmd, ns_init_pid)?.wait()?;
 
     Ok(())
 }
 
-pub fn spawn_process_inside(base_dir: &Path, name: &str) -> Result<()> {
+pub fn spawn_process_inside(name: &str, ns_pid: u32) -> Result<()> {
     for proc in procfs::process::all_processes()? {
         let Ok(proc) = proc else { continue };
         let Ok(cmdline) = proc.cmdline() else {
@@ -209,6 +271,6 @@ pub fn spawn_process_inside(base_dir: &Path, name: &str) -> Result<()> {
     }
 
     debug!("Spawning {name} process inside namespaces");
-    spawn_inside_all_namespaces(base_dir, &Command::new(name))?;
+    spawn_inside_all_namespaces(&Command::new(name), ns_pid)?;
     Ok(())
 }

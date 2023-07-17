@@ -1,4 +1,4 @@
-use crate::namespace::{self, find_process_in_namespace, is_mounted, run_inside_namespace, Type};
+use crate::namespace::{self, all_ns_processes, is_mounted, run_inside_namespace, Type};
 use crate::net::default_route_iface_name;
 use anyhow::{bail, Context, Result};
 use nix::sys::signal::{kill, Signal};
@@ -11,9 +11,7 @@ use tracing::debug;
 pub fn down() -> Result<()> {
     let base_dir = namespace::base_dir()?;
 
-    kill_process("warp-svc")?;
-    kill_process("danted")?;
-    kill_process("danted: io-chil")?;
+    kill_ns_processes(&base_dir)?;
 
     if is_mounted(&base_dir, Type::Mount)? {
         clean_mount_namespace(&base_dir)?;
@@ -28,10 +26,18 @@ pub fn down() -> Result<()> {
     Ok(())
 }
 
-fn kill_process(name: &str) -> Result<()> {
-    if let Some(pid) = find_process_in_namespace(name)? {
-        debug!("Killing running {name} process");
-        kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
+fn kill_ns_processes(base_dir: &Path) -> Result<()> {
+    let ns_procs = all_ns_processes(base_dir)?;
+    for proc in ns_procs {
+        if !proc.is_alive() {
+            continue;
+        }
+        if let Ok(cmdline) = proc.cmdline() {
+            debug!("Killing pid {} '{}'", proc.pid, cmdline.join(" "));
+        } else {
+            debug!("Killing pid {} (failed to get cmdline)", proc.pid);
+        };
+        let _ = kill(Pid::from_raw(proc.pid), Signal::SIGTERM);
     }
     Ok(())
 }

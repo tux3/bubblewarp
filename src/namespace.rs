@@ -1,9 +1,9 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::OsStr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
 use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount as EnumCountMacro, EnumIter};
 use tracing::trace;
@@ -134,7 +134,7 @@ pub fn run_inside_namespace(base_dir: &Path, ns_type: Type, cmd: &Command) -> Re
     Ok(out)
 }
 
-fn spawn_inside_all_namespaces_of_pid(cmd: &Command, ns_pid: u32) -> Result<Child> {
+pub fn spawn_inside_all_namespaces(cmd: &Command, ns_pid: u32) -> Result<Child> {
     let mut ns_cmd = Command::new("nsenter");
     ns_cmd.args(["-a", "-t", &ns_pid.to_string()]);
     ns_cmd.stdout(Stdio::null());
@@ -144,59 +144,17 @@ fn spawn_inside_all_namespaces_of_pid(cmd: &Command, ns_pid: u32) -> Result<Chil
     Ok(child)
 }
 
-pub fn spawn_inside_all_namespaces(base_dir: &Path, cmd: &Command) -> Result<Child> {
-    // There is a weird dance we have to do, where nsenter will make fork failed if used directly
-    // But if we start a dummy cat process with nsenter, and then enter cat's namespaces, all good
-    let mut cat_cmd = Command::new("nsenter");
-    cat_cmd.arg("-F");
-    for ns_type in Type::iter() {
-        cat_cmd.arg(format!(
-            "--{}={}",
-            ns_type.to_string(),
-            mount_point(base_dir, ns_type).to_string_lossy()
-        ));
-    }
-    cat_cmd.arg("cat");
-    let mut cat_handle = cat_cmd.spawn()?;
-
-    let child = spawn_inside_all_namespaces_of_pid(cmd, cat_handle.id())?;
-
-    // Disgusting hardcoded sleep. We just want to give nsenter time to finish joining...
-    // Ideally we should watch that the new process has entered all the namespaces.. but good enough!
-    std::thread::sleep(Duration::from_millis(250));
-    let _ = cat_handle.kill();
-
-    Ok(child)
-}
-
-// This really just returns any matching process _not_ in the root namespace
-pub fn find_process_in_namespace(name: &str) -> Result<Option<u32>> {
-    let osstr_net = OsString::from("net");
-    let pid1_netns = procfs::process::Process::new(1)?
-        .namespaces()?
-        .get(&osstr_net)
-        .unwrap()
-        .identifier;
-
-    for proc in procfs::process::all_processes()? {
-        let Ok(proc) = proc else { continue };
-        let Ok(cmdline) = proc.cmdline() else {
-            continue;
-        };
-        if cmdline.is_empty() || !cmdline[0].ends_with(name) {
-            continue;
+pub fn all_ns_processes(base_dir: &Path) -> Result<impl Iterator<Item = procfs::process::Process>> {
+    let pid_ns_id = std::fs::metadata(mount_point(base_dir, Type::Pid))?.ino();
+    Ok(procfs::process::all_processes()?.filter_map(move |p| {
+        let Ok(p) = p else { return None };
+        if p.namespaces().is_ok_and(|map| {
+            map.get(OsStr::new("pid"))
+                .is_some_and(|pid_ns| pid_ns.identifier == pid_ns_id)
+        }) {
+            Some(p)
+        } else {
+            None
         }
-        let Ok(namespaces) = proc.namespaces() else {
-            continue;
-        };
-        let Some(netns) = namespaces.get(&osstr_net) else {
-            continue;
-        };
-        if netns.identifier == pid1_netns {
-            trace!("Found a {name} process, but it seems to be outside the namespace...");
-            continue;
-        }
-        return Ok(Some(proc.pid as u32));
-    }
-    Ok(None)
+    }))
 }

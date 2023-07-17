@@ -7,12 +7,12 @@ use tracing::debug;
 fn parse_iface_name(ip_route_default_stdout: Vec<u8>) -> Result<String> {
     let out = String::from_utf8(ip_route_default_stdout)?;
     let parts: Vec<&str> = out.split(' ').collect();
-    if parts.is_empty() {
+    if out.is_empty() || parts.is_empty() {
         bail!("Empty stdout when running ip route show default!")
     }
     let pos_dev = parts.iter().position(|&e| e == "dev");
     if parts[0] != "default" || pos_dev.is_none() || parts.len() <= pos_dev.unwrap() + 1 {
-        bail!("Unexpected output from ip route show default")
+        bail!("Unexpected output from ip route show default: {}", out)
     }
     Ok(parts[pos_dev.unwrap() + 1].to_owned())
 }
