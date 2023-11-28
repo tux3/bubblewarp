@@ -35,6 +35,13 @@ pub fn default_route_iface_name() -> Result<String> {
 }
 
 pub fn setup_private_networking(base_dir: &Path) -> Result<()> {
+    debug!("Making sure loopback interface is up");
+    run_inside_namespace(
+        base_dir,
+        Type::Net,
+        Command::new("ip").args(["link", "set", "dev", "lo", "up"]),
+    )?;
+
     if nix::ifaddrs::getifaddrs()?.any(|dev| dev.interface_name == "veth-warp") {
         debug!("veth-warp iface seems to already exist, not re-creating it");
         return Ok(());
